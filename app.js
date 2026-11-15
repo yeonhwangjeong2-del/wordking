@@ -141,10 +141,19 @@ function home() {
       : `<div class="empty">아직 단어장이 없어요.<br>단어가 적힌 페이지를 찍어보세요.</div>`}
     </div>`;
   $('#snap').onclick = () => $('#photo').click();
+  // Inline input instead of prompt(): prompt() is blocked in some browsers.
   $('#add-folder').onclick = () => {
-    const name = prompt('새 폴더 이름')?.trim();
-    if (!name) return;
-    const f = { id: uid(), name }; db.folders.push(f); save(); ui.folderId = f.id; render();
+    $('.tabs').outerHTML = `<form class="tabs" id="folder-form">
+      <input id="folder-name" placeholder="새 폴더 이름" maxlength="30" style="max-width:240px">
+      <button class="btn">추가</button><button type="button" class="btn ghost" id="folder-cancel">취소</button></form>`;
+    $('#folder-name').focus();
+    $('#folder-cancel').onclick = render;
+    $('#folder-form').onsubmit = e => {
+      e.preventDefault();
+      const name = $('#folder-name').value.trim();
+      if (!name) return;
+      const f = { id: uid(), name }; db.folders.push(f); save(); ui.folderId = f.id; render();
+    };
   };
   document.querySelectorAll('[data-folder]').forEach(b => b.onclick = () => { ui.folderId = b.dataset.folder; render(); });
   document.querySelectorAll('[data-page]').forEach(b => b.onclick = () => openPage(b.dataset.page));
