@@ -75,6 +75,15 @@
   .dots .due, .ev.due i { background: #e67e22; } .dots .late, .ev.late i { background: var(--red); } .dots .done, .ev.done i { background: #27ae60; }
   .cal-h { font-size: 18px; margin: 20px 0 10px; }
   .ev { font-size: 16px; }
+  .extra { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding-left: 14px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 4px 6px 4px 12px; font-size: 15px; }
+  .chip.syn { background: #e3f2fd; color: #1565c0; } .chip.ant { background: #fdecea; color: #c0392b; }
+  .chip .mark { font-size: 15px; }
+  .cko { font-size: 14px; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.7); color: var(--ink); cursor: pointer; }
+  .cko.hidden { background: var(--hide); color: transparent; }
+  .mini { background: transparent; border: 1px solid var(--line); color: var(--muted); font-size: 13px; padding: 5px 10px; border-radius: 999px; }
+  .ex { flex-basis: 100%; background: var(--paper); border-left: 3px solid var(--navy); padding: 8px 12px; border-radius: 6px; font-size: 16px; line-height: 1.5; }
+  .ex small { display: block; color: var(--muted); font-size: 14px; }
   .mark { font-size: 22px; font-weight: 700; }
   .mark.tri { color: #d68910; } .mark.x { color: var(--red); } .mark.o { color: #2e86c1; }
   .word.result .ko { cursor: default; }

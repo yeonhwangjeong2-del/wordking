@@ -47,7 +47,11 @@ function nextRound(p) {
   return null;
 }
 const doneSteps = p => ['r1', 'r2', 'r3'].filter(k => p.rounds?.[k]).length;
-const wrongIdx = p => p.words.map((w, i) => (w.wrong ? i : -1)).filter(i => i >= 0);
+// Test items: { pid, wi } for a word, plus s ('syn' | 'ant') and k for its synonyms/antonyms, which are tested as words too.
+function pageItems(p, onlyWrong = false) {
+  return p.words.flatMap((w, wi) => [{ pid: p.id, wi }, ...['syn', 'ant'].flatMap(s => (w[s] || []).map((_, k) => ({ pid: p.id, wi, s, k })))])
+    .filter(it => !onlyWrong || wordOf(it).wrong);
+}
 
 // Folder-wide 오답 총복습 every 5 days, counted from the first 1차 시험 (then from the last 총복습).
 function bigDue(fid) {
@@ -56,7 +60,7 @@ function bigDue(fid) {
   const f = db.folders.find(x => x.id === fid);
   return addDays(f.lastBig || firsts[0], 5);
 }
-const bigItems = fid => folderPages(fid).flatMap(p => wrongIdx(p).map(wi => ({ pid: p.id, wi })));
+const bigItems = fid => folderPages(fid).flatMap(p => pageItems(p, true));
 
 // ---------- Claude API ----------
 async function claude(system, content, schema) {
@@ -166,21 +170,54 @@ function startTest(items, kind, title, back) {
   ui.test = { items, kind, title, back, i: 0, answers: [], result: null };
   ui.view = 'test'; render();
 }
-const wordOf = it => db.pages.find(p => p.id === it.pid)?.words[it.wi];
+const wordOf = it => { const w = db.pages.find(p => p.id === it.pid)?.words[it.wi]; return it.s ? w?.[it.s]?.[it.k] : w; };
 
 // Starts whatever the page needs next: the due round, or a practice test if nothing is due yet.
 function startPageTest(p) {
   const nr = nextRound(p);
   const back = { view: 'page', pageId: p.id };
   if (nr && nr.due <= today()) {
-    const idx = nr.kind === 'r3' ? wrongIdx(p) : p.words.map((_, i) => i);
-    if (!idx.length) { // nothing ever wrong → 복습2 has no words, count it as done
+    const items = pageItems(p, nr.kind === 'r3');
+    if (!items.length) { // nothing ever wrong → 복습2 has no words, count it as done
       p.rounds.r3 = today(); db.log.push({ date: today(), folderId: p.folderId, pageId: p.id, kind: 'r3' }); save();
       alert('틀린 단어가 없어서 복습2 완료!'); return render();
     }
-    return startTest(idx.map(wi => ({ pid: p.id, wi })), nr.kind, `Day ${p.day} ${ROUND[nr.kind]}`, back);
+    return startTest(items, nr.kind, `Day ${p.day} ${ROUND[nr.kind]}`, back);
   }
-  startTest(p.words.map((_, wi) => ({ pid: p.id, wi })), 'practice', `Day ${p.day} 연습`, back);
+  startTest(pageItems(p), 'practice', `Day ${p.day} 연습`, back);
+}
+
+// ---------- synonyms / antonyms / example ----------
+const REL_SYSTEM = `You help a Korean student studying English vocabulary.
+Given an English word and its Korean meaning, list synonyms and antonyms used in that sense.
+Synonyms: 1 to 3, closest first. Give 3 only if there really are 3 close, common ones; otherwise 1 or 2.
+Antonyms: up to 3 common opposites, closest first; an empty list if the word has no real opposite.
+Each item is a single common English word or short phrase with a short Korean meaning.`;
+const REL_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['syn', 'ant'],
+  properties: Object.fromEntries(['syn', 'ant'].map(k => [k, { type: 'array', items: {
+    type: 'object', additionalProperties: false, required: ['en', 'ko'],
+    properties: { en: { type: 'string' }, ko: { type: 'string' } }
+  } }]))
+};
+const EX_SYSTEM = `Write one short, natural English example sentence that uses the given word in the given Korean sense,
+at a high-school level, and its Korean translation.`;
+const EX_SCHEMA = { type: 'object', additionalProperties: false, required: ['en', 'ko'], properties: { en: { type: 'string' }, ko: { type: 'string' } } };
+
+async function makeRelated(w) {
+  busy(`${w.en} 유의어·반의어 만드는 중…`);
+  try {
+    const out = await claude(REL_SYSTEM, JSON.stringify({ word: w.en, meaning: w.ko }), REL_SCHEMA);
+    const clean = list => list.filter(x => x.en.trim() && x.en.toLowerCase() !== w.en.toLowerCase()).slice(0, 3);
+    w.syn = clean(out.syn); w.ant = clean(out.ant); save();
+  } catch (err) { alert(err.message); }
+  busy();
+}
+async function makeExample(w) {
+  busy(`${w.en} 예문 만드는 중…`);
+  try { w.ex = await claude(EX_SYSTEM, JSON.stringify({ word: w.en, meaning: w.ko }), EX_SCHEMA); save(); }
+  catch (err) { alert(err.message); }
+  busy();
 }
 
 async function finishTest() {
@@ -406,7 +443,7 @@ function review() {
   };
 }
 
-function openPage(id) { ui.pageId = id; ui.view = 'page'; ui.hideAll = false; ui.shown = new Set(); render(); }
+function openPage(id) { ui.pageId = id; ui.view = 'page'; ui.hideAll = false; ui.shown = new Set(); ui.exOpen = new Set(); render(); }
 
 function page() {
   const p = db.pages.find(x => x.id === ui.pageId);
@@ -415,7 +452,7 @@ function page() {
   const hidden = i => ui.hideAll !== ui.shown.has(i); // tapping a word flips it against the page-wide setting
   const nr = nextRound(p);
   const testLabel = !nr || nr.due > today() ? '연습 시험'
-    : nr.kind === 'r3' ? `복습2 (틀린 단어 ${wrongIdx(p).length}개)` : `${ROUND[nr.kind]} (전체)`;
+    : nr.kind === 'r3' ? `복습2 (틀린 단어 ${pageItems(p, true).length}개)` : `${ROUND[nr.kind]} (전체)`;
   $('#app').innerHTML = `
     <header><button class="icon-btn" data-go="home" aria-label="뒤로">←</button>
       <h1>Day ${p.day}</h1><small>${idx + 1} / ${list.length}</small></header>
@@ -429,14 +466,31 @@ function page() {
     </div>
     <div class="sheet">${p.words.map((w, i) => `
       <div class="word"><span class="n">${w.mark && w.mark !== 'o' ? MARK[w.mark] : i + 1}</span><span class="en">${esc(w.en)}</span>
-      <span class="ko ${hidden(i) ? 'hidden' : ''}" data-ko="${i}">${esc(w.ko)}</span></div>`).join('')}</div>
+      <span class="ko ${hidden(i) ? 'hidden' : ''}" data-ko="${i}">${esc(w.ko)}</span>
+      <div class="extra">
+        ${['syn', 'ant'].flatMap(s => (w[s] || []).map(x => `<span class="chip ${s}">${x.mark && x.mark !== 'o' ? MARK[x.mark] : ''}<b>${esc(x.en)}</b>
+          <span class="cko ${hidden(i) ? 'hidden' : ''}" data-ko="${i}">${esc(x.ko)}</span></span>`)).join('')}
+        ${w.syn ? (w.syn.length + w.ant.length ? '' : '<span class="hint">유의어·반의어 없음</span>') : `<button class="mini" data-rel="${i}">유의어·반의어</button>`}
+        <button class="mini" data-ex="${i}">${ui.exOpen?.has(i) ? '예문 닫기' : '예문'}</button>
+        ${w.ex && ui.exOpen?.has(i) ? `<div class="ex">${esc(w.ex.en)}<small>${esc(w.ex.ko)}</small></div>` : ''}
+      </div></div>`).join('')}</div>
     <div class="pager">
       <button class="btn ghost" id="prev" ${idx ? '' : 'disabled'}>◀ 이전</button>
       <button class="btn ghost" id="next" ${idx < list.length - 1 ? '' : 'disabled'}>다음 ▶</button>
     </div>`;
   document.querySelectorAll('[data-ko]').forEach(el => el.onclick = () => {
-    const i = +el.dataset.ko; ui.shown.has(i) ? ui.shown.delete(i) : ui.shown.add(i); el.classList.toggle('hidden', hidden(i));
+    const i = +el.dataset.ko; ui.shown.has(i) ? ui.shown.delete(i) : ui.shown.add(i);
+    document.querySelectorAll(`[data-ko="${i}"]`).forEach(x => x.classList.toggle('hidden', hidden(i)));
   });
+  const keepScroll = async fn => { const y = scrollY; await fn(); page(); scrollTo(0, y); };
+  document.querySelectorAll('[data-rel]').forEach(b => b.onclick = () => keepScroll(() => makeRelated(p.words[+b.dataset.rel])));
+  document.querySelectorAll('[data-ex]').forEach(b => b.onclick = () => keepScroll(async () => {
+    const i = +b.dataset.ex, w = p.words[i];
+    ui.exOpen ||= new Set();
+    if (ui.exOpen.has(i)) return ui.exOpen.delete(i);
+    if (!w.ex) await makeExample(w);
+    if (w.ex) ui.exOpen.add(i);
+  }));
   $('#start-test').onclick = () => startPageTest(p);
   $('#toggle-all').onclick = () => { ui.hideAll = !ui.hideAll; ui.shown = new Set(); page(); };
   $('#del-page').onclick = () => {
