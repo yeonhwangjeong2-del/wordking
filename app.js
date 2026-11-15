@@ -103,6 +103,52 @@ $('#photo').addEventListener('change', async e => {
   busy(); render();
 });
 
+// ---------- test grading ----------
+const GRADE_SYSTEM = `You grade a Korean student's English vocabulary test.
+For each item you get the English word, the reference Korean meaning, and the student's Korean answer.
+Grade "o" if the answer means the same as the reference (different wording or another correct meaning of the word is fine),
+"tri" if it is close or partly right but imprecise, "x" if it is wrong.`;
+const GRADE_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['grades'],
+  properties: { grades: { type: 'array', items: {
+    type: 'object', additionalProperties: false, required: ['i', 'g'],
+    properties: { i: { type: 'integer' }, g: { type: 'string', enum: ['o', 'tri', 'x'] } }
+  } } }
+};
+const norm = s => s.replace(/\s+/g, '').toLowerCase();
+
+// Blank → x, exact match → o, everything else goes to the AI in one call.
+async function grade(items) {
+  const g = items.map(it => !norm(it.answer) ? 'x' : norm(it.answer) === norm(it.ref) ? 'o' : null);
+  const ask = items.map((it, i) => ({ i, en: it.en, ref: it.ref, answer: it.answer })).filter(x => g[x.i] === null);
+  if (ask.length) {
+    const out = await claude(GRADE_SYSTEM, JSON.stringify(ask), GRADE_SCHEMA);
+    for (const { i, g: v } of out.grades) if (g[i] === null) g[i] = v;
+  }
+  return g.map(v => v ?? 'x');
+}
+
+function startTest(pageId, idx) {
+  ui.test = { pageId, idx, i: 0, answers: [], result: null };
+  ui.view = 'test'; render();
+}
+
+async function finishTest() {
+  const t = ui.test, p = db.pages.find(x => x.id === t.pageId);
+  busy('AI가 채점하는 중…');
+  try {
+    const items = t.idx.map((wi, k) => ({ en: p.words[wi].en, ref: p.words[wi].ko, answer: t.answers[k] || '' }));
+    const g = await grade(items);
+    t.idx.forEach((wi, k) => {
+      const w = p.words[wi];
+      w.mark = g[k];
+      if (g[k] !== 'o') w.wrong = true; // ever wrong (△ counts) — used by the review schedule
+    });
+    save(); t.result = g;
+  } catch (err) { alert(err.message); }
+  busy(); render();
+}
+
 // ---------- backup ----------
 function exportBackup() {
   const blob = new Blob([JSON.stringify(db)], { type: 'application/json' });
@@ -122,7 +168,49 @@ $('#restore').addEventListener('change', async e => {
 });
 
 // ---------- views ----------
-function render() { ({ home, review, page, settings })[ui.view](); window.scrollTo(0, 0); }
+function render() { ({ home, review, page, settings, test })[ui.view](); window.scrollTo(0, 0); }
+
+const MARK = { tri: '<span class="mark tri" title="비슷함">△</span>', x: '<span class="mark x" title="틀림">—</span>', o: '<span class="mark o" title="맞음">○</span>' };
+
+function test() {
+  const t = ui.test, p = db.pages.find(x => x.id === t.pageId);
+  if (!p) { ui.view = 'home'; return render(); }
+  const back = `<button class="icon-btn" id="quit" aria-label="그만하기">✕</button>`;
+  if (t.result) {
+    const wrong = t.idx.filter((_, k) => t.result[k] !== 'o');
+    const score = t.result.filter(v => v === 'o').length;
+    $('#app').innerHTML = `
+      <header>${back}<h1>Day ${p.day} 결과</h1><small>${score} / ${t.idx.length}</small></header>
+      <div class="sheet">${t.idx.map((wi, k) => `
+        <div class="word result"><span class="n">${MARK[t.result[k]]}</span><span class="en">${esc(p.words[wi].en)}</span>
+        <span class="ko"><span class="mine">${esc(t.answers[k] || '(모름)')}</span>${t.result[k] !== 'o' ? `<br><b>${esc(p.words[wi].ko)}</b>` : ''}</span></div>`).join('')}</div>
+      <div class="pager">
+        ${wrong.length ? `<button class="btn" id="retry-wrong">틀린 것만 다시 (${wrong.length})</button>` : ''}
+        <button class="btn ghost" id="retry-all">전체 다시</button>
+      </div>`;
+    $('#retry-wrong')?.addEventListener('click', () => startTest(p.id, wrong));
+    $('#retry-all').onclick = () => startTest(p.id, p.words.map((_, i) => i));
+  } else {
+    const w = p.words[t.idx[t.i]];
+    $('#app').innerHTML = `
+      <header>${back}<h1>Day ${p.day} 시험</h1><small>${t.i + 1} / ${t.idx.length}</small></header>
+      <form id="qa" class="quiz">
+        <div class="quiz-en">${esc(w.en)}</div>
+        <input id="ans" autocomplete="off" autocapitalize="off" placeholder="뜻을 쓰세요" value="${esc(t.answers[t.i] || '')}">
+        <div class="pager">
+          <button type="button" class="btn ghost" id="prev-q" ${t.i ? '' : 'disabled'}>◀ 이전</button>
+          <button type="button" class="btn ghost" id="skip">모름</button>
+          <button class="btn">${t.i < t.idx.length - 1 ? '다음 ▶' : '채점하기'}</button>
+        </div>
+      </form>`;
+    $('#ans').focus();
+    const next = () => { t.answers[t.i] = $('#ans').value.trim(); if (++t.i < t.idx.length) test(); else finishTest(); };
+    $('#qa').onsubmit = e => { e.preventDefault(); next(); };
+    $('#skip').onclick = () => { $('#ans').value = ''; next(); };
+    $('#prev-q').onclick = () => { t.answers[t.i] = $('#ans').value.trim(); t.i--; test(); };
+  }
+  $('#quit').onclick = () => { ui.view = 'page'; ui.pageId = p.id; render(); };
+}
 
 function home() {
   if (!db.folders.some(f => f.id === ui.folderId)) ui.folderId = db.folders[0].id;
@@ -197,11 +285,12 @@ function page() {
     <header><button class="icon-btn" data-go="home" aria-label="뒤로">←</button>
       <h1>Day ${p.day}</h1><small>${idx + 1} / ${list.length}</small></header>
     <div class="toolbar">
+      <button class="btn" id="start-test">✏️ 시험 보기</button>
       <button class="btn ghost" id="toggle-all">${ui.hideAll ? '뜻 전부 보기' : '뜻 전부 가리기'}</button>
       <button class="btn danger" id="del-page">이 페이지 삭제</button>
     </div>
     <div class="sheet">${p.words.map((w, i) => `
-      <div class="word"><span class="n">${i + 1}</span><span class="en">${esc(w.en)}</span>
+      <div class="word"><span class="n">${w.mark && w.mark !== 'o' ? MARK[w.mark] : i + 1}</span><span class="en">${esc(w.en)}</span>
       <span class="ko ${hidden(i) ? 'hidden' : ''}" data-ko="${i}">${esc(w.ko)}</span></div>`).join('')}</div>
     <div class="pager">
       <button class="btn ghost" id="prev" ${idx ? '' : 'disabled'}>◀ 이전</button>
@@ -210,6 +299,7 @@ function page() {
   document.querySelectorAll('[data-ko]').forEach(el => el.onclick = () => {
     const i = +el.dataset.ko; ui.shown.has(i) ? ui.shown.delete(i) : ui.shown.add(i); el.classList.toggle('hidden', hidden(i));
   });
+  $('#start-test').onclick = () => startTest(p.id, p.words.map((_, i) => i));
   $('#toggle-all').onclick = () => { ui.hideAll = !ui.hideAll; ui.shown = new Set(); page(); };
   $('#del-page').onclick = () => {
     if (!confirm(`Day ${p.day} 페이지를 삭제할까요? 되돌릴 수 없어요.`)) return;
