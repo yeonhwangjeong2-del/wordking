@@ -4,7 +4,7 @@
 // shortcut: everything lives in one localStorage JSON (~5MB limit, ~tens of thousands of words); move to IndexedDB if it ever fills up.
 const KEY = 'wordking';
 const DEFAULT_DB = {
-  settings: { apiKey: '', model: 'claude-haiku-5-5', perDay: 30 },
+  settings: { apiKey: '', geminiKey: '', model: 'gemini-3.5-flash-lite', perDay: 30 },
   folders: [{ id: 'daily', name: 'DailyWord' }, { id: 'exam', name: 'ExamWord' }],
   pages: [], // { id, folderId, day, createdAt, rounds: { r1, r2, r3 }, words: [{ en, ko, mark, wrong }] }
   log: [] // { date, folderId, pageId, kind } one entry per finished test, for the calendar
@@ -13,6 +13,7 @@ let db;
 try { db = JSON.parse(localStorage.getItem(KEY)) || structuredClone(DEFAULT_DB); }
 catch { db = structuredClone(DEFAULT_DB); }
 db.log ||= [];
+if (!db.settings.apiKey && db.settings.model.startsWith('claude')) db.settings.model = DEFAULT_DB.settings.model; // never set up Claude → free Gemini
 const save = () => localStorage.setItem(KEY, JSON.stringify(db));
 if (navigator.storage?.persist) navigator.storage.persist();
 
@@ -62,10 +63,39 @@ function bigDue(fid) {
 }
 const bigItems = fid => folderPages(fid).flatMap(p => pageItems(p, true));
 
-// ---------- Claude API ----------
+// ---------- AI (Gemini free tier or Claude) ----------
+// content is Claude-style: a string, or [{ type: 'image', source }, { type: 'text', text }].
+const ai = (system, content, schema) => (db.settings.model.startsWith('gemini') ? gemini : claude)(system, content, schema);
+
+async function gemini(system, content, schema) {
+  const s = db.settings;
+  if (!s.geminiKey) throw new Error('설정(⚙︎)에서 Gemini API 키를 먼저 넣어주세요.');
+  const parts = typeof content === 'string' ? [{ text: content }]
+    : content.map(b => (b.type === 'image' ? { inlineData: { mimeType: b.source.media_type, data: b.source.data } } : { text: b.text }));
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${s.model}:generateContent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': s.geminiKey },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: 'user', parts }],
+      generationConfig: { responseMimeType: 'application/json', responseJsonSchema: schema }
+    })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    if (j.error?.details?.some(d => d.reason === 'API_KEY_INVALID')) throw new Error('Gemini API 키가 틀렸어요. 설정에서 확인해주세요.');
+    if (r.status === 429) throw new Error('무료 사용량을 잠깐 다 썼어요. 1분쯤 뒤에 다시 해주세요.');
+    throw new Error(j.error?.message || `오류 ${r.status}`);
+  }
+  const c = j.candidates?.[0];
+  if (!c?.content) throw new Error('AI가 이 요청을 처리하지 못했어요.');
+  if (c.finishReason === 'MAX_TOKENS') throw new Error('단어가 너무 많아요. 사진을 나눠서 찍어주세요.');
+  return JSON.parse(c.content.parts.filter(p => p.text && !p.thought).map(p => p.text).join(''));
+}
+
 async function claude(system, content, schema) {
   const s = db.settings;
-  if (!s.apiKey) throw new Error('설정(⚙︎)에서 API 키를 먼저 넣어주세요.');
+  if (!s.apiKey) throw new Error('설정(⚙︎)에서 Claude API 키를 먼저 넣어주세요.');
   const headers = {
     'content-type': 'application/json',
     'x-api-key': s.apiKey,
@@ -128,7 +158,7 @@ $('#photo').addEventListener('change', async e => {
     for (let i = 0; i < files.length; i++) {
       busy(`AI가 단어를 읽는 중… (${i + 1}/${files.length})`);
       const data = await toJpegBase64(files[i]);
-      const out = await claude(EXTRACT_SYSTEM, [
+      const out = await ai(EXTRACT_SYSTEM, [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } },
         { type: 'text', text: 'Extract the vocabulary.' }
       ], WORDS_SCHEMA);
@@ -159,7 +189,7 @@ async function grade(items) {
   const g = items.map(it => !norm(it.answer) ? 'x' : norm(it.answer) === norm(it.ref) ? 'o' : null);
   const ask = items.map((it, i) => ({ i, en: it.en, ref: it.ref, answer: it.answer })).filter(x => g[x.i] === null);
   if (ask.length) {
-    const out = await claude(GRADE_SYSTEM, JSON.stringify(ask), GRADE_SCHEMA);
+    const out = await ai(GRADE_SYSTEM, JSON.stringify(ask), GRADE_SCHEMA);
     for (const { i, g: v } of out.grades) if (g[i] === null) g[i] = v;
   }
   return g.map(v => v ?? 'x');
@@ -207,7 +237,7 @@ const EX_SCHEMA = { type: 'object', additionalProperties: false, required: ['en'
 async function makeRelated(w) {
   busy(`${w.en} 유의어·반의어 만드는 중…`);
   try {
-    const out = await claude(REL_SYSTEM, JSON.stringify({ word: w.en, meaning: w.ko }), REL_SCHEMA);
+    const out = await ai(REL_SYSTEM, JSON.stringify({ word: w.en, meaning: w.ko }), REL_SCHEMA);
     const clean = list => list.filter(x => x.en.trim() && x.en.toLowerCase() !== w.en.toLowerCase()).slice(0, 3);
     w.syn = clean(out.syn); w.ant = clean(out.ant); save();
   } catch (err) { alert(err.message); }
@@ -215,7 +245,7 @@ async function makeRelated(w) {
 }
 async function makeExample(w) {
   busy(`${w.en} 예문 만드는 중…`);
-  try { w.ex = await claude(EX_SYSTEM, JSON.stringify({ word: w.en, meaning: w.ko }), EX_SCHEMA); save(); }
+  try { w.ex = await ai(EX_SYSTEM, JSON.stringify({ word: w.en, meaning: w.ko }), EX_SCHEMA); save(); }
   catch (err) { alert(err.message); }
   busy();
 }
@@ -253,6 +283,7 @@ $('#restore').addEventListener('change', async e => {
     if (!Array.isArray(data.pages) || !Array.isArray(data.folders) || !data.settings) throw 0;
     if (!confirm('지금 데이터가 백업 파일 내용으로 바뀌어요. 계속할까요?')) return;
     data.settings.apiKey ||= db.settings.apiKey;
+    data.settings.geminiKey ||= db.settings.geminiKey;
     db = data; save(); ui.view = 'home'; render();
   } catch { alert('WordKing 백업 파일이 아니에요.'); }
 });
@@ -516,14 +547,17 @@ function settings() {
   const s = db.settings;
   $('#app').innerHTML = `
     <header><button class="icon-btn" data-go="home" aria-label="뒤로">←</button><h1>설정</h1></header>
-    <label for="key">Claude API 키</label>
-    <input id="key" type="password" autocomplete="off" placeholder="sk-ant-..." value="${esc(s.apiKey)}">
-    <p class="hint">platform.claude.com → API Keys에서 만든 키. 이 아이패드에만 저장돼요.</p>
     <label for="model">AI 모델</label>
     <select id="model">
-      <option value="claude-haiku-5-5" ${s.model === 'claude-haiku-5-5' ? 'selected' : ''}>Haiku 5.5 · 아주 저렴</option>
-      <option value="claude-opus-5-5" ${s.model === 'claude-opus-5-5' ? 'selected' : ''}>Opus 5.5 · 더 정확, 더 비쌈</option>
+      ${[['gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite · 무료'], ['gemini-3-flash-preview', 'Gemini 3 Flash · 무료, 더 똑똑함'],
+         ['claude-haiku-5-5', 'Claude Haiku 5.5 · 유료, 저렴'], ['claude-opus-5-5', 'Claude Opus 5.5 · 유료, 가장 정확']]
+        .map(([v, t]) => `<option value="${v}" ${s.model === v ? 'selected' : ''}>${t}</option>`).join('')}
     </select>
+    <label for="gkey">Gemini API 키</label>
+    <input id="gkey" type="password" autocomplete="off" placeholder="AIza..." value="${esc(s.geminiKey)}">
+    <p class="hint">aistudio.google.com → Get API key에서 무료로 만들 수 있어요. 이 기기에만 저장돼요.</p>
+    <label for="key">Claude API 키 <small>(Claude 모델 쓸 때만)</small></label>
+    <input id="key" type="password" autocomplete="off" placeholder="sk-ant-..." value="${esc(s.apiKey)}">
     <label for="per">하루 단어 수</label>
     <input id="per" type="number" min="1" max="200" inputmode="numeric" value="${s.perDay}">
     <p class="hint">새로 저장하는 단어부터 적용돼요.</p>
@@ -537,12 +571,12 @@ function settings() {
   $('#save-set').onclick = () => {
     const per = Math.round(+$('#per').value);
     if (!(per >= 1 && per <= 200)) return alert('하루 단어 수는 1~200 사이로 넣어주세요.');
-    Object.assign(s, { apiKey: $('#key').value.trim(), model: $('#model').value, perDay: per });
+    Object.assign(s, { apiKey: $('#key').value.trim(), geminiKey: $('#gkey').value.trim(), model: $('#model').value, perDay: per });
     save(); ui.view = 'home'; render();
   };
   $('#backup').onclick = () => {
-    const key = db.settings.apiKey; db.settings.apiKey = '';
-    try { exportBackup(); } finally { db.settings.apiKey = key; }
+    const { apiKey, geminiKey } = db.settings; Object.assign(db.settings, { apiKey: '', geminiKey: '' });
+    try { exportBackup(); } finally { Object.assign(db.settings, { apiKey, geminiKey }); }
   };
   $('#load').onclick = () => $('#restore').click();
   bindGo();
