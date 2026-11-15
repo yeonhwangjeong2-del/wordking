@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="WordKing">
+<meta name="theme-color" content="#1f3a5f">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.png">
+<title>WordKing</title>
+<style>
+  :root {
+    --paper: #f7f5f0; --card: #fffdf8; --ink: #1d2433; --muted: #7a8090;
+    --line: #e4dfd3; --navy: #1f3a5f; --navy-soft: #e6edf6; --red: #c0392b;
+    --hide: #d9d4c7;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--paper); color: var(--ink);
+    font-family: -apple-system, "Apple SD Gothic Neo", "Segoe UI", sans-serif; }
+  body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  #app { max-width: 820px; margin: 0 auto; padding: 16px 16px 48px; }
+  header { display: flex; align-items: center; gap: 12px; margin: 8px 0 20px; }
+  header h1 { font-size: 26px; margin: 0; flex: 1; letter-spacing: -0.5px; }
+  header h1 span { color: var(--navy); }
+  button { font: inherit; border: none; cursor: pointer; border-radius: 12px; }
+  .icon-btn { background: var(--card); border: 1px solid var(--line); width: 44px; height: 44px; font-size: 20px; }
+  .btn { background: var(--navy); color: #fff; padding: 14px 18px; font-weight: 600; font-size: 16px; }
+  .btn.ghost { background: var(--card); color: var(--navy); border: 1px solid var(--line); }
+  .btn.danger { background: var(--card); color: var(--red); border: 1px solid var(--line); }
+  .btn.big { width: 100%; padding: 20px; font-size: 18px; margin-bottom: 20px; }
+  .tabs { display: flex; gap: 8px; overflow-x: auto; margin-bottom: 16px; padding-bottom: 4px; }
+  .tab { background: var(--card); border: 1px solid var(--line); padding: 10px 16px; white-space: nowrap; color: var(--ink); }
+  .tab.on { background: var(--navy); color: #fff; border-color: var(--navy); }
+  .list { display: flex; flex-direction: column; gap: 10px; }
+  .row { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px;
+    display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; color: var(--ink); }
+  .row b { font-size: 18px; }
+  .row small { color: var(--muted); margin-left: auto; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; line-height: 1.7; }
+  /* notebook page */
+  .sheet { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 8px 0;
+    background-image: linear-gradient(90deg, transparent 52px, #f0c9c4 52px, #f0c9c4 54px, transparent 54px); }
+  .word { display: grid; grid-template-columns: 40px 1fr 1fr; align-items: center; gap: 12px;
+    padding: 14px 18px 14px 8px; border-bottom: 1px solid var(--line); min-height: 60px; }
+  .word:last-child { border-bottom: none; }
+  .word .n { color: var(--muted); font-size: 13px; text-align: right; }
+  .word .en { font-size: 22px; font-weight: 600; padding-left: 14px; word-break: break-word; }
+  .word .ko { font-size: 17px; padding: 8px 10px; border-radius: 8px; cursor: pointer; user-select: none; line-height: 1.4; }
+  .word .ko.hidden { background: var(--hide); color: transparent; }
+  .pager { display: flex; gap: 10px; margin-top: 16px; }
+  .pager .btn { flex: 1; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  /* review */
+  .edit { display: grid; grid-template-columns: 1fr 1.3fr 44px; gap: 8px; margin-bottom: 8px; }
+  input, select { font: inherit; font-size: 16px; padding: 12px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--card); color: var(--ink); width: 100%; }
+  label { display: block; font-weight: 600; margin: 18px 0 6px; }
+  .hint { color: var(--muted); font-size: 14px; margin-top: 6px; line-height: 1.5; }
+  #busy { position: fixed; inset: 0; background: rgba(247,245,240,.92); display: none; align-items: center;
+    justify-content: center; flex-direction: column; gap: 14px; font-size: 18px; z-index: 10; }
+  #busy.on { display: flex; }
+  .spin { width: 40px; height: 40px; border: 4px solid var(--navy-soft); border-top-color: var(--navy);
+    border-radius: 50%; animation: s 0.9s linear infinite; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  @media (max-width: 560px) {
+    .word { grid-template-columns: 28px 1fr; }
+    .word .ko { grid-column: 2; }
+    .edit { grid-template-columns: 1fr 1fr 44px; }
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="busy"><div class="spin"></div><div id="busy-msg"></div></div>
+<input id="photo" type="file" accept="image/*" multiple hidden>
+<input id="restore" type="file" accept="application/json,.json" hidden>
+<script src="app.js"></script>
+</body>
+</html>
