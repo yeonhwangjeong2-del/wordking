@@ -194,8 +194,9 @@ $('#photo').addEventListener('change', async e => {
 // ---------- test grading ----------
 const GRADE_SYSTEM = `You grade a Korean student's English vocabulary test.
 For each item you get the English word, the reference Korean meaning, and the student's Korean answer.
-Grade "o" if the answer means the same as the reference (different wording or another correct meaning of the word is fine),
-"tri" if it is close or partly right but imprecise, "x" if it is wrong.`;
+Be lenient. Grade "o" if the answer is roughly the same or a similar meaning: a synonym, a looser or broader paraphrase,
+a different part of speech (e.g. 행복 for 행복한), another correct meaning of the word, or a small typo.
+Grade "tri" only if it is related but clearly misses the main sense. Grade "x" if it is wrong or unrelated.`;
 const GRADE_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['grades'],
   properties: { grades: { type: 'array', items: {
