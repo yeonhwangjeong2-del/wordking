@@ -3,21 +3,24 @@
 // ---------- storage ----------
 // shortcut: everything lives in one localStorage JSON (~5MB limit, ~tens of thousands of words); move to IndexedDB if it ever fills up.
 const KEY = 'wordking';
+const newFolder = (id, name) => ({ id, name, words: [], days: [] });
 const DEFAULT_DB = {
+  v: 2,
   settings: { apiKey: '', geminiKey: '', model: 'gemini-3.5-flash-lite', perDay: 30 },
-  folders: [{ id: 'daily', name: 'DailyWord' }, { id: 'exam', name: 'ExamWord' }],
-  pages: [], // { id, folderId, day, createdAt, rounds: { r1, r2, r3 }, words: [{ en, ko, mark, wrong }] }
-  log: [] // { date, folderId, pageId, kind } one entry per finished test, for the calendar
+  // folder.words: the word pool, in the order added: [{ id, en, ko, ex?, syn?, ant?, mark?, wrong? }]
+  // folder.days[n-1]: { ids?, done: { test, r1, r2, big } }. ids is fixed when Day n's 1차 시험 is done.
+  folders: [newFolder('daily', 'DailyWord'), newFolder('exam', 'ExamWord')],
+  log: [] // { date, fid, n, kind } one entry per finished test, for the calendar
 };
 let db;
-try { db = JSON.parse(localStorage.getItem(KEY)) || structuredClone(DEFAULT_DB); }
-catch { db = structuredClone(DEFAULT_DB); }
-db.log ||= [];
-if (!db.settings.apiKey && db.settings.model.startsWith('claude')) db.settings.model = DEFAULT_DB.settings.model; // never set up Claude → free Gemini
+try { db = JSON.parse(localStorage.getItem(KEY)); } catch { db = null; }
+if (db?.v !== 2) db = { ...structuredClone(DEFAULT_DB), settings: { ...DEFAULT_DB.settings, ...db?.settings } }; // v1 data: wiped on purpose, keys kept
+if (!db.settings.apiKey && db.settings.model.startsWith('claude')) db.settings.model = DEFAULT_DB.settings.model;
 const save = () => localStorage.setItem(KEY, JSON.stringify(db));
+save();
 if (navigator.storage?.persist) navigator.storage.persist();
 
-const ui = { view: 'home', folderId: 'daily', pageId: null, draft: [], hideAll: false, shown: new Set() };
+const ui = { view: 'home', folderId: 'daily', dayN: 1, draft: [], hideAll: false, shown: new Set(), exOpen: new Set() };
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -26,42 +29,58 @@ const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, 
 console.assert(JSON.stringify(chunk([1, 2, 3, 4, 5], 2)) === '[[1,2],[3,4],[5]]', 'chunk');
 
 function busy(msg) { $('#busy').classList.toggle('on', !!msg); $('#busy-msg').textContent = msg || ''; }
-const folderPages = fid => db.pages.filter(p => p.folderId === fid).sort((a, b) => a.day - b.day);
+const folderOf = fid => db.folders.find(f => f.id === fid);
 
-// ---------- dates & review schedule ----------
+// ---------- dates ----------
 const pad = n => String(n).padStart(2, '0');
 const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; // local date, compares as a string
 const today = () => ymd(new Date());
-const addDays = (s, n) => { const d = new Date(s + 'T00:00'); d.setDate(d.getDate() + n); return ymd(d); };
-const maxDate = (a, b) => (a > b ? a : b);
 const md = s => `${+s.slice(5, 7)}/${+s.slice(8)}`;
-console.assert(addDays('2026-02-28', 1) === '2026-03-01' && addDays('2026-12-31', 1) === '2027-01-01', 'addDays');
 
-const ROUND = { r1: '1차 시험', r2: '복습1', r3: '복습2', big: '오답 총복습', practice: '연습' };
-const DONE_TEXT = ['학습 전', '1차 완료', '복습1 완료', '복습2 완료'];
-// Day page flow: r1 on study day (all words) → r2 next day (all words) → r3 the day after (ever-wrong words only).
-function nextRound(p) {
-  const r = p.rounds ||= {};
-  if (!r.r1) return { kind: 'r1', due: today() };
-  if (!r.r2) return { kind: 'r2', due: addDays(r.r1, 1) };
-  if (!r.r3) return { kind: 'r3', due: maxDate(addDays(r.r1, 2), addDays(r.r2, 1)) };
-  return null;
+// ---------- Days ----------
+// Days are cut from the folder's word pool in order, perDay words each. Days already tested keep their words;
+// the rest of the pool is re-cut every time, so a half-full Day keeps filling until its 1차 시험.
+// Two review-only Days follow the last word Day so its 복습1/복습2 have somewhere to live.
+function planDays(f, per = db.settings.perDay) {
+  const fixed = [];
+  for (const d of f.days) { if (!d?.ids) break; fixed.push(d.ids); }
+  const used = new Set(fixed.flat());
+  const rest = chunk(f.words.filter(w => !used.has(w.id)).map(w => w.id), per);
+  const wordDays = [...fixed, ...rest];
+  return wordDays.length ? [...wordDays, [], []] : [];
 }
-const doneSteps = p => ['r1', 'r2', 'r3'].filter(k => p.rounds?.[k]).length;
-// Test items: { pid, wi } for a word, plus s ('syn' | 'ant') and k for its synonyms/antonyms, which are tested as words too.
-function pageItems(p, onlyWrong = false) {
-  return p.words.flatMap((w, wi) => [{ pid: p.id, wi }, ...['syn', 'ant'].flatMap(s => (w[s] || []).map((_, k) => ({ pid: p.id, wi, s, k })))])
+console.assert(JSON.stringify(planDays({ words: [1, 2, 3, 4, 5].map(id => ({ id })), days: [] }, 2)) === '[[1,2],[3,4],[5],[],[]]', 'planDays');
+console.assert(JSON.stringify(planDays({ words: [1, 2, 3, 4, 5].map(id => ({ id })), days: [{ ids: [1], done: {} }] }, 2)) === '[[1],[2,3],[4,5],[],[]]', 'planDays fixed');
+
+const dayRec = (f, n) => (f.days[n - 1] ||= { done: {} });
+const isDone = (f, n, kind) => !!f.days[n - 1]?.done?.[kind];
+const LABEL = { test: '1차 시험', r1: '복습1', r2: '복습2', big: '오답 총복습', practice: '연습' };
+
+// Day n: its own 1차 시험, Day n-1's 복습1 (all words), Day n-2's 복습2 (ever-wrong only), and 오답 총복습 on every 5th Day.
+function dayTasks(f, plan, n) {
+  const t = [];
+  if (plan[n - 1].length) t.push({ kind: 'test', src: n, ids: plan[n - 1] });
+  if (n >= 2 && plan[n - 2].length) t.push({ kind: 'r1', src: n - 1, ids: plan[n - 2] });
+  if (n >= 3 && plan[n - 3].length) t.push({ kind: 'r2', src: n - 2, ids: plan[n - 3], onlyWrong: true });
+  if (n % 5 === 0) t.push({ kind: 'big', ids: plan.slice(0, n).filter((_, i) => isDone(f, i + 1, 'test')).flat(), onlyWrong: true });
+  return t.map(x => ({ ...x, done: f.days[n - 1]?.done?.[x.kind] }));
+}
+// Day n opens once the Day before it has its 1차 시험 done (or, for a review-only Day, all its tasks done).
+function isOpen(f, plan, n) {
+  if (n === 1) return true;
+  const prev = dayTasks(f, plan, n - 1);
+  return prev.some(t => t.kind === 'test') ? !!prev.find(t => t.kind === 'test').done : isOpen(f, plan, n - 1) && prev.every(t => t.done);
+}
+// A word counts as finished once its Day's 복습2 is done.
+const finishedWords = f => { const plan = planDays(f); return plan.reduce((s, ids, i) => s + (ids.length && isDone(f, i + 3, 'r2') ? ids.length : 0), 0); };
+
+// Test items: { fid, id } for a word, plus s ('syn' | 'ant') and k for its synonyms/antonyms, which are tested as words too.
+const wordById = (f, id) => f.words.find(w => w.id === id);
+const wordOf = it => { const w = wordById(folderOf(it.fid) || { words: [] }, it.id); return it.s ? w?.[it.s]?.[it.k] : w; };
+function itemsFor(f, ids, onlyWrong = false) {
+  return ids.flatMap(id => { const w = wordById(f, id); return w ? [{ fid: f.id, id }, ...['syn', 'ant'].flatMap(s => (w[s] || []).map((_, k) => ({ fid: f.id, id, s, k })))] : []; })
     .filter(it => !onlyWrong || wordOf(it).wrong);
 }
-
-// Folder-wide 오답 총복습 every 5 days, counted from the first 1차 시험 (then from the last 총복습).
-function bigDue(fid) {
-  const firsts = folderPages(fid).map(p => p.rounds?.r1).filter(Boolean).sort();
-  if (!firsts.length) return null;
-  const f = db.folders.find(x => x.id === fid);
-  return addDays(f.lastBig || firsts[0], 5);
-}
-const bigItems = fid => folderPages(fid).flatMap(p => pageItems(p, true));
 
 // ---------- AI (Gemini free tier or Claude) ----------
 // content is Claude-style: a string, or [{ type: 'image', source }, { type: 'text', text }].
@@ -123,12 +142,14 @@ async function claude(system, content, schema) {
 const EXTRACT_SYSTEM = `You read photos of English vocabulary lists or textbook pages for a Korean student.
 Return every English word or phrase in the photo, in the order shown, with its Korean meaning.
 Use the Korean meaning printed in the photo when there is one; otherwise write a short, common Korean meaning.
-Skip page numbers, headings, and example sentences. Do not add words that are not in the photo.`;
-const WORDS_SCHEMA = {
+If the photo shows an example sentence for a word (next to or under it), put it in ex_en and its Korean translation in ex_ko
+(use the printed translation if there is one, otherwise translate it). If there is no example sentence, leave both empty.
+Skip page numbers and headings. Do not add words that are not in the photo.`;
+const EXTRACT_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['words'],
   properties: { words: { type: 'array', items: {
-    type: 'object', additionalProperties: false, required: ['en', 'ko'],
-    properties: { en: { type: 'string' }, ko: { type: 'string' } }
+    type: 'object', additionalProperties: false, required: ['en', 'ko', 'ex_en', 'ex_ko'],
+    properties: { en: { type: 'string' }, ko: { type: 'string' }, ex_en: { type: 'string' }, ex_ko: { type: 'string' } }
   } } }
 };
 
@@ -161,8 +182,8 @@ $('#photo').addEventListener('change', async e => {
       const out = await ai(EXTRACT_SYSTEM, [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } },
         { type: 'text', text: 'Extract the vocabulary.' }
-      ], WORDS_SCHEMA);
-      found.push(...out.words.filter(w => w.en.trim()));
+      ], EXTRACT_SCHEMA);
+      for (const w of out.words) if (w.en.trim()) found.push({ en: w.en, ko: w.ko, ex: w.ex_en.trim() ? { en: w.ex_en.trim(), ko: w.ex_ko.trim() } : null });
     }
     if (!found.length) throw new Error('사진에서 영단어를 찾지 못했어요.');
     ui.draft = found; ui.manual = false; ui.view = 'review';
@@ -195,26 +216,34 @@ async function grade(items) {
   return g.map(v => v ?? 'x');
 }
 
-// items: [{ pid, wi }] so one test can span pages (오답 총복습). kind: r1 | r2 | r3 | big | practice.
-function startTest(items, kind, title, back) {
-  ui.test = { items, kind, title, back, i: 0, answers: [], result: null };
+// ctx: { fid, n, kind, ids } — kind is test | r1 | r2 | big | practice; ids are Day n's words for a 1차 시험.
+function startTest(items, ctx, title) {
+  ui.test = { items, ctx, title, i: 0, answers: [], result: null };
   ui.view = 'test'; render();
 }
-const wordOf = it => { const w = db.pages.find(p => p.id === it.pid)?.words[it.wi]; return it.s ? w?.[it.s]?.[it.k] : w; };
 
-// Starts whatever the page needs next: the due round, or a practice test if nothing is due yet.
-function startPageTest(p) {
-  const nr = nextRound(p);
-  const back = { view: 'page', pageId: p.id };
-  if (nr && nr.due <= today()) {
-    const items = pageItems(p, nr.kind === 'r3');
-    if (!items.length) { // nothing ever wrong → 복습2 has no words, count it as done
-      p.rounds.r3 = today(); db.log.push({ date: today(), folderId: p.folderId, pageId: p.id, kind: 'r3' }); save();
-      alert('틀린 단어가 없어서 복습2 완료!'); return render();
-    }
-    return startTest(items, nr.kind, `Day ${p.day} ${ROUND[nr.kind]}`, back);
-  }
-  startTest(pageItems(p), 'practice', `Day ${p.day} 연습`, back);
+function markDone(f, n, kind, ids) {
+  const rec = dayRec(f, n);
+  rec.done[kind] = today();
+  if (kind === 'test') rec.ids = ids;
+  db.log.push({ date: today(), fid: f.id, n, kind });
+}
+
+async function finishTest() {
+  const t = ui.test;
+  busy('AI가 채점하는 중…');
+  try {
+    const g = await grade(t.items.map((it, k) => { const w = wordOf(it); return { en: w.en, ref: w.ko, answer: t.answers[k] || '' }; }));
+    t.items.forEach((it, k) => {
+      const w = wordOf(it);
+      w.mark = g[k];
+      if (g[k] !== 'o') w.wrong = true; // ever wrong (△ counts) — feeds 복습2 and 오답 총복습
+    });
+    const { fid, n, kind, ids } = t.ctx;
+    if (kind !== 'practice') markDone(folderOf(fid), n, kind, ids);
+    save(); t.result = g;
+  } catch (err) { alert(err.message); }
+  busy(); render();
 }
 
 // ---------- meanings for typed words ----------
@@ -273,25 +302,6 @@ async function makeExample(w) {
   busy();
 }
 
-async function finishTest() {
-  const t = ui.test;
-  busy('AI가 채점하는 중…');
-  try {
-    const g = await grade(t.items.map((it, k) => { const w = wordOf(it); return { en: w.en, ref: w.ko, answer: t.answers[k] || '' }; }));
-    t.items.forEach((it, k) => {
-      const w = wordOf(it);
-      w.mark = g[k];
-      if (g[k] !== 'o') w.wrong = true; // ever wrong (△ counts) — feeds 복습2 and 오답 총복습
-    });
-    const first = db.pages.find(p => p.id === t.items[0].pid);
-    if (t.kind.startsWith('r')) first.rounds[t.kind] = today();
-    if (t.kind === 'big') db.folders.find(f => f.id === first.folderId).lastBig = today();
-    db.log.push({ date: today(), folderId: first.folderId, pageId: t.kind === 'big' ? null : first.id, kind: t.kind });
-    save(); t.result = g;
-  } catch (err) { alert(err.message); }
-  busy(); render();
-}
-
 // ---------- backup ----------
 function exportBackup() {
   const blob = new Blob([JSON.stringify(db)], { type: 'application/json' });
@@ -303,7 +313,7 @@ $('#restore').addEventListener('change', async e => {
   if (!f) return;
   try {
     const data = JSON.parse(await f.text());
-    if (!Array.isArray(data.pages) || !Array.isArray(data.folders) || !data.settings) throw 0;
+    if (data.v !== 2 || !Array.isArray(data.folders) || !data.settings) throw 0;
     if (!confirm('지금 데이터가 백업 파일 내용으로 바뀌어요. 계속할까요?')) return;
     data.settings.apiKey ||= db.settings.apiKey;
     data.settings.geminiKey ||= db.settings.geminiKey;
@@ -312,27 +322,14 @@ $('#restore').addEventListener('change', async e => {
 });
 
 // ---------- views ----------
-function render() { ({ home, review, page, settings, test, calendar })[ui.view](); window.scrollTo(0, 0); }
+function render() { ({ home, review, day, settings, test, calendar })[ui.view](); window.scrollTo(0, 0); }
+function bindGo() { document.querySelectorAll('[data-go]').forEach(b => b.onclick = () => { ui.view = b.dataset.go; render(); }); }
+const MARK = { tri: '<span class="mark tri" title="비슷함">△</span>', x: '<span class="mark x" title="틀림">—</span>', o: '<span class="mark o" title="맞음">○</span>' };
 
-// Month grid: green = tests done that day, orange = reviews due, red = overdue. Tap a date for details.
+// Calendar: green dot on days with finished tests. Tap a date to list them.
 function dayEvents(date) {
-  const t = today(), ev = [];
-  const name = fid => db.folders.find(f => f.id === fid)?.name ?? '';
-  for (const l of db.log.filter(l => l.date === date)) {
-    const p = db.pages.find(x => x.id === l.pageId);
-    if (l.pageId && !p) continue;
-    ev.push({ type: 'done', text: `${name(l.folderId)} ${p ? `Day ${p.day} ` : ''}${ROUND[l.kind]} 완료`, pid: p?.id });
-  }
-  for (const p of db.pages) {
-    const nr = nextRound(p);
-    if (!nr || nr.kind === 'r1') continue;
-    if (nr.due === date || (date === t && nr.due < t)) ev.push({ type: nr.due < t ? 'late' : 'due', text: `${name(p.folderId)} Day ${p.day} ${ROUND[nr.kind]}${nr.due < t ? ' (밀림)' : ''}`, pid: p.id });
-  }
-  for (const f of db.folders) {
-    const bd = bigDue(f.id);
-    if (bd && bigItems(f.id).length && (bd === date || (date === t && bd < t))) ev.push({ type: bd < t ? 'late' : 'due', text: `${f.name} 오답 총복습`, fid: f.id });
-  }
-  return ev;
+  return db.log.filter(l => l.date === date && folderOf(l.fid))
+    .map(l => ({ fid: l.fid, n: l.n, text: `${folderOf(l.fid).name} Day ${l.n} ${LABEL[l.kind]} 완료` }));
 }
 
 function calendar() {
@@ -350,31 +347,22 @@ function calendar() {
       <button class="icon-btn" id="pm" aria-label="이전 달">‹</button><button class="icon-btn" id="nm" aria-label="다음 달">›</button></header>
     <div class="cal">
       ${['일', '월', '화', '수', '목', '금', '토'].map(d => `<div class="dow">${d}</div>`).join('')}
-      ${cells.map(c => {
-        if (!c) return '<div></div>';
-        const ev = dayEvents(c), has = k => ev.some(e => e.type === k);
-        return `<button class="day ${c === t ? 'today' : ''} ${c === ui.calDay ? 'sel' : ''}" data-day="${c}">${+c.slice(8)}
-          <span class="dots">${has('done') ? '<i class="done"></i>' : ''}${has('due') ? '<i class="due"></i>' : ''}${has('late') ? '<i class="late"></i>' : ''}</span></button>`;
-      }).join('')}
+      ${cells.map(c => c ? `<button class="day ${c === t ? 'today' : ''} ${c === ui.calDay ? 'sel' : ''}" data-day="${c}">${+c.slice(8)}
+          <span class="dots">${dayEvents(c).length ? '<i class="done"></i>' : ''}</span></button>` : '<div></div>').join('')}
     </div>
     <h2 class="cal-h">${md(ui.calDay)}${ui.calDay === t ? ' (오늘)' : ''}</h2>
-    <div class="list">${sel.length ? sel.map((e, i) => `<button class="row ev ${e.type}" data-ev="${i}"><i></i>${esc(e.text)}</button>`).join('')
+    <div class="list">${sel.length ? sel.map((e, i) => `<button class="row ev done" data-ev="${i}"><i></i>${esc(e.text)}</button>`).join('')
       : '<div class="empty">이 날은 기록이 없어요.</div>'}</div>`;
   $('#pm').onclick = () => shift(-1);
   $('#nm').onclick = () => shift(1);
   document.querySelectorAll('[data-day]').forEach(b => b.onclick = () => { ui.calDay = b.dataset.day; calendar(); });
-  document.querySelectorAll('[data-ev]').forEach(b => b.onclick = () => {
-    const e = sel[+b.dataset.ev];
-    if (e.pid) openPage(e.pid); else if (e.fid) { ui.folderId = e.fid; ui.view = 'home'; render(); }
-  });
+  document.querySelectorAll('[data-ev]').forEach(b => b.onclick = () => { const e = sel[+b.dataset.ev]; ui.folderId = e.fid; openDay(e.n); });
   bindGo();
 }
 
-const MARK = { tri: '<span class="mark tri" title="비슷함">△</span>', x: '<span class="mark x" title="틀림">—</span>', o: '<span class="mark o" title="맞음">○</span>' };
-
 function test() {
   const t = ui.test;
-  t.items = t.items.filter(wordOf); // a page may have been deleted
+  t.items = t.items.filter(wordOf);
   if (!t.items.length) { ui.view = 'home'; return render(); }
   const back = `<button class="icon-btn" id="quit" aria-label="그만하기">✕</button>`;
   if (t.result) {
@@ -389,9 +377,9 @@ function test() {
         ${wrong.length ? `<button class="btn" id="retry-wrong">틀린 것만 다시 (${wrong.length})</button>` : ''}
         <button class="btn ghost" id="retry-all">전체 다시</button>
       </div>`;
-    const title = t.title.replace(/ (1차 시험|복습\d|연습)$/, '') + ' 연습';
-    $('#retry-wrong')?.addEventListener('click', () => startTest(wrong, 'practice', title, t.back));
-    $('#retry-all').onclick = () => startTest(t.items, 'practice', title, t.back);
+    const ctx = { ...t.ctx, kind: 'practice' }, title = `${t.title.replace(/ 연습$/, '')} 연습`;
+    $('#retry-wrong')?.addEventListener('click', () => startTest(wrong, ctx, title));
+    $('#retry-all').onclick = () => startTest(t.items, ctx, title);
   } else {
     const w = wordOf(t.items[t.i]);
     $('#app').innerHTML = `
@@ -411,47 +399,44 @@ function test() {
     $('#skip').onclick = () => { $('#ans').value = ''; next(); };
     $('#prev-q').onclick = () => { t.answers[t.i] = $('#ans').value.trim(); t.i--; test(); };
   }
-  $('#quit').onclick = () => { if (!t.result && t.i && !confirm('시험을 그만둘까요? 기록이 안 남아요.')) return; Object.assign(ui, t.back); render(); };
+  $('#quit').onclick = () => {
+    if (!t.result && t.i && !confirm('시험을 그만둘까요? 기록이 안 남아요.')) return;
+    ui.folderId = t.ctx.fid; ui.dayN = t.ctx.n; ui.view = 'day'; render();
+  };
 }
 
-// Progress pill: 0/3 grey → 1/3 orange → 2/3 yellow → 3/3 green.
-const PILL = ['#9aa0a6', '#e67e22', '#e0b400', '#27ae60'];
-function dayStatus(p) {
-  const n = doneSteps(p), nr = nextRound(p), t = today();
-  const due = nr && nr.kind !== 'r1' && nr.due <= t ? `<span class="duebadge">${nr.due < t ? '밀림' : '오늘'} ${ROUND[nr.kind]}</span>` : '';
-  return `<span class="pill" style="background:${PILL[n]}">${Math.round(n / 3 * 100)}%</span><span class="st">${DONE_TEXT[n]}</span>${due}`;
-}
+// Progress pill colour: 0% grey → orange → yellow (≥50%) → 100% green.
+const pillColor = p => (p === 0 ? '#9aa0a6' : p === 100 ? '#27ae60' : p >= 50 ? '#e0b400' : '#e67e22');
+const taskName = t => (t.kind === 'test' ? '1차 시험' : t.kind === 'big' ? '오답 총복습' : `Day ${t.src} ${LABEL[t.kind]}`);
 
 function home() {
-  if (!db.folders.some(f => f.id === ui.folderId)) ui.folderId = db.folders[0].id;
-  const pages = folderPages(ui.folderId);
-  const total = db.pages.reduce((n, p) => n + p.words.length, 0);
-  const inFolder = pages.reduce((n, p) => n + p.words.length, 0);
-  const bd = bigDue(ui.folderId), big = bigItems(ui.folderId);
+  if (!folderOf(ui.folderId)) ui.folderId = db.folders[0].id;
+  const f = folderOf(ui.folderId), plan = planDays(f);
+  const finished = db.folders.reduce((s, x) => s + finishedWords(x), 0);
   $('#app').innerHTML = `
     <header><h1>Word<span>King</span></h1>
       <button class="icon-btn" data-go="calendar" aria-label="달력">📅</button>
       <button class="icon-btn" data-go="settings" aria-label="설정">⚙︎</button></header>
-    <div class="stat"><div><small>누적 단어</small><strong>${total.toLocaleString()}</strong></div>
-      <span>이 폴더 ${inFolder.toLocaleString()}개 · Day ${pages.length}개</span></div>
+    <div class="stat"><div><small>누적 완료 단어 (복습2까지 끝낸 단어)</small><strong>${finished.toLocaleString()}</strong></div>
+      <span>이 폴더에 저장된 단어 ${f.words.length.toLocaleString()}개</span></div>
     <div class="tabs">
-      ${db.folders.map(f => `<button class="tab ${f.id === ui.folderId ? 'on' : ''}" data-folder="${f.id}">${esc(f.name)}</button>`).join('')}
+      ${db.folders.map(x => `<button class="tab ${x.id === f.id ? 'on' : ''}" data-folder="${x.id}">${esc(x.name)}</button>`).join('')}
       <button class="tab" id="add-folder">＋ 폴더</button>
     </div>
-    ${bd && big.length ? `<button class="row bigrev ${bd <= today() ? 'now' : ''}" id="big">
-      <b>🔥 오답 총복습</b><span>틀린 적 있는 단어 ${big.length}개</span>
-      <small>${bd <= today() ? '오늘 할 차례!' : `${md(bd)} 예정 · 미리 연습`}</small></button>` : ''}
     <div class="add-row"><button class="btn big" id="snap">📷 사진으로 단어 추가</button>
       <button class="btn big ghost" id="type">✍️ 직접 입력</button></div>
     <div class="list">
-      ${pages.length ? pages.map(p => `
-        <button class="row" data-page="${p.id}"><b>Day ${p.day}</b><span>${p.words.length}단어</span>${dayStatus(p)}</button>`).join('')
-      : `<div class="empty">아직 단어장이 없어요.<br>단어가 적힌 페이지를 찍어보세요.</div>`}
+      ${plan.length ? plan.map((ids, i) => {
+        const n = i + 1, open = isOpen(f, plan, n), tasks = dayTasks(f, plan, n);
+        const pct = Math.round(tasks.filter(t => t.done).length / tasks.length * 100);
+        return `<button class="row ${open ? '' : 'locked'}" data-n="${n}" ${open ? '' : 'disabled'}>
+          <b>Day ${n}</b><span>${ids.length ? `새 단어 ${ids.length}` : '복습만'}</span>
+          ${open ? `<span class="pill" style="background:${pillColor(pct)}">${pct}%</span>
+            <span class="tasks">${tasks.map(t => `<span class="${t.done ? 'ok' : ''}">${t.done ? '✓ ' : ''}${esc(taskName(t))}</span>`).join('')}</span>`
+          : `<small>🔒 Day ${n - 1} 먼저</small>`}</button>`;
+      }).join('')
+      : `<div class="empty">아직 단어가 없어요.<br>사진을 찍거나 직접 입력해서 단어를 넣어보세요.</div>`}
     </div>`;
-  $('#big')?.addEventListener('click', () => {
-    const f = db.folders.find(x => x.id === ui.folderId);
-    startTest(big, bd <= today() ? 'big' : 'practice', `${f.name} 오답 총복습`, { view: 'home' });
-  });
   $('#snap').onclick = () => $('#photo').click();
   $('#type').onclick = () => { ui.draft = [{ en: '', ko: '' }]; ui.manual = true; ui.view = 'review'; render(); $('[data-k="en"]').focus(); };
   // Inline input instead of prompt(): prompt() is blocked in some browsers.
@@ -465,25 +450,25 @@ function home() {
       e.preventDefault();
       const name = $('#folder-name').value.trim();
       if (!name) return;
-      const f = { id: uid(), name }; db.folders.push(f); save(); ui.folderId = f.id; render();
+      const nf = newFolder(uid(), name); db.folders.push(nf); save(); ui.folderId = nf.id; render();
     };
   };
   document.querySelectorAll('[data-folder]').forEach(b => b.onclick = () => { ui.folderId = b.dataset.folder; render(); });
-  document.querySelectorAll('[data-page]').forEach(b => b.onclick = () => openPage(b.dataset.page));
+  document.querySelectorAll('[data-n]').forEach(b => b.onclick = () => openDay(+b.dataset.n));
   bindGo();
 }
 
 function review() {
-  const folder = db.folders.find(f => f.id === ui.folderId);
-  const per = db.settings.perDay;
+  const f = folderOf(ui.folderId);
   $('#app').innerHTML = `
     <header><button class="icon-btn" id="cancel" aria-label="취소">✕</button><h1>${ui.manual ? '단어 입력' : '단어 확인'}</h1></header>
     <p class="hint">${ui.manual ? '영어 철자만 쓰면 뜻은 AI가 채워요. 뜻을 직접 써도 돼요.' : `${ui.draft.length}개를 찾았어요. 틀린 건 고치고 저장하세요.`}
-      <b>${esc(folder.name)}</b>에 하루 ${per}개씩 Day ${Math.max(1, Math.ceil(ui.draft.length / per))}개로 나눠 저장돼요.</p>
+      <b>${esc(f.name)}</b> 단어 모음에 저장되고, 하루 ${db.settings.perDay}개씩 Day로 나뉘어요.</p>
     <div id="edits">${ui.draft.map((w, i) => `
       <div class="edit"><input data-i="${i}" data-k="en" value="${esc(w.en)}" aria-label="영단어">
       <input data-i="${i}" data-k="ko" value="${esc(w.ko)}" placeholder="뜻 (비우면 AI)" aria-label="뜻">
-      <button class="icon-btn" data-del="${i}" aria-label="삭제">✕</button></div>`).join('')}</div>
+      <button class="icon-btn" data-del="${i}" aria-label="삭제">✕</button>
+      ${w.ex ? `<p class="hint ex-line">예문: ${esc(w.ex.en)}</p>` : ''}</div>`).join('')}</div>
     <div class="toolbar"><button class="btn ghost" id="add-row">＋ 단어 추가</button>
       <button class="btn ghost" id="fill">✨ 빈 뜻 AI로 채우기</button></div>
     <button class="btn big" id="save">저장</button>`;
@@ -503,81 +488,73 @@ function review() {
   $('#cancel').onclick = () => { if (confirm(ui.manual ? '입력한 단어를 버릴까요?' : '찾은 단어를 버릴까요?')) { ui.draft = []; ui.view = 'home'; render(); } };
   $('#save').onclick = async () => {
     if (ui.draft.some(w => w.en.trim() && !w.ko.trim()) && !(await fillMeanings(ui.draft))) return review();
-    const words = ui.draft.map(w => ({ en: w.en.trim(), ko: w.ko.trim() })).filter(w => w.en);
+    const words = ui.draft.filter(w => w.en.trim()).map(w => ({ id: uid(), en: w.en.trim(), ko: w.ko.trim(), ...(w.ex && { ex: w.ex }) }));
     if (!words.length) return alert('저장할 단어가 없어요.');
-    let day = Math.max(0, ...folderPages(ui.folderId).map(p => p.day));
-    for (const part of chunk(words, per)) db.pages.push({ id: uid(), folderId: ui.folderId, day: ++day, createdAt: Date.now(), words: part });
+    f.words.push(...words);
     save(); ui.draft = []; ui.manual = false; ui.view = 'home'; render();
   };
 }
 
-function openPage(id) { ui.pageId = id; ui.view = 'page'; ui.hideAll = false; ui.shown = new Set(); ui.exOpen = new Set(); render(); }
+function openDay(n) { ui.dayN = n; ui.view = 'day'; ui.hideAll = false; ui.shown = new Set(); ui.exOpen = new Set(); render(); }
 
-function page() {
-  const p = db.pages.find(x => x.id === ui.pageId);
-  if (!p) { ui.view = 'home'; return render(); }
-  const list = folderPages(p.folderId), idx = list.indexOf(p);
+function day() {
+  const f = folderOf(ui.folderId), plan = planDays(f), n = ui.dayN;
+  if (!plan[n - 1]) { ui.view = 'home'; return render(); }
+  const open = isOpen(f, plan, n), tasks = dayTasks(f, plan, n);
+  const words = plan[n - 1].map(id => wordById(f, id));
   const hidden = i => ui.hideAll !== ui.shown.has(i); // tapping a word flips it against the page-wide setting
-  const nr = nextRound(p);
-  const testLabel = !nr || nr.due > today() ? '연습 시험'
-    : nr.kind === 'r3' ? `복습2 (틀린 단어 ${pageItems(p, true).length}개)` : `${ROUND[nr.kind]} (전체)`;
   $('#app').innerHTML = `
     <header><button class="icon-btn" data-go="home" aria-label="뒤로">←</button>
-      <h1>Day ${p.day}</h1><small>${idx + 1} / ${list.length}</small></header>
-    <div class="steps">${['r1', 'r2', 'r3'].map(k => p.rounds[k]
-      ? `<span class="step done">✓ ${ROUND[k]} <small>${md(p.rounds[k])}</small></span>`
-      : `<span class="step ${nr?.kind === k && nr.due <= today() ? 'now' : ''}">${ROUND[k]}${nr?.kind === k && k !== 'r1' ? ` <small>${nr.due <= today() ? '오늘' : md(nr.due)}</small>` : ''}</span>`).join('')}</div>
-    <div class="toolbar">
-      <button class="btn" id="start-test">✏️ ${testLabel}</button>
-      <button class="btn ghost" id="toggle-all">${ui.hideAll ? '뜻 전부 보기' : '뜻 전부 가리기'}</button>
-      <button class="btn danger" id="del-page">이 페이지 삭제</button>
-    </div>
-    <div class="sheet">${p.words.map((w, i) => `
+      <h1>Day ${n}</h1><small>${esc(f.name)}</small></header>
+    ${open ? `<div class="task-list">${tasks.map((t, k) => {
+      const count = itemsFor(f, t.ids, t.onlyWrong).length;
+      return `<div class="task ${t.done ? 'ok' : ''}"><b>${t.done ? '✓ ' : ''}${esc(taskName(t))}</b>
+        <span>${t.onlyWrong ? `틀린 적 있는 단어 ${count}개` : `${count}문제`}${t.done ? ` · ${md(t.done)} 완료` : ''}</span>
+        <button class="btn ${t.done ? 'ghost' : ''}" data-task="${k}">${count ? (t.done ? '연습' : '시험 보기') : (t.done ? '완료' : '틀린 단어 없음 → 완료')}</button></div>`;
+    }).join('')}</div>` : `<div class="empty">🔒 Day ${n - 1}의 1차 시험을 먼저 끝내주세요.</div>`}
+    ${words.length ? `<div class="toolbar"><button class="btn ghost" id="toggle-all">${ui.hideAll ? '뜻 전부 보기' : '뜻 전부 가리기'}</button></div>
+    <div class="sheet grid2">${words.map((w, i) => `
       <div class="word"><span class="n">${w.mark && w.mark !== 'o' ? MARK[w.mark] : i + 1}</span><span class="en">${esc(w.en)}</span>
       <span class="ko ${hidden(i) ? 'hidden' : ''}" data-ko="${i}">${esc(w.ko)}</span>
-      <div class="extra">
-        ${['syn', 'ant'].flatMap(s => (w[s] || []).map(x => `<span class="chip ${s}">${x.mark && x.mark !== 'o' ? MARK[x.mark] : ''}<b>${esc(x.en)}</b>
-          <span class="cko ${hidden(i) ? 'hidden' : ''}" data-ko="${i}">${esc(x.ko)}</span></span>`)).join('')}
-        ${w.syn ? (w.syn.length + w.ant.length ? '' : '<span class="hint">유의어·반의어 없음</span>') : `<button class="mini" data-rel="${i}">유의어·반의어</button>`}
-        <button class="mini" data-ex="${i}">${ui.exOpen?.has(i) ? '예문 닫기' : '예문'}</button>
-        ${w.ex && ui.exOpen?.has(i) ? `<div class="ex">${esc(w.ex.en)}<small>${esc(w.ex.ko)}</small></div>` : ''}
-      </div></div>`).join('')}</div>
+      <span class="acts">${w.syn ? '' : `<button class="mini" data-rel="${i}" title="유의어·반의어">유·반</button>`}<button class="mini ${ui.exOpen.has(i) ? 'on' : ''}" data-ex="${i}">예문</button></span>
+      ${(w.syn?.length || w.ant?.length) ? `<div class="extra">${['syn', 'ant'].flatMap(s => (w[s] || []).map(x => `<span class="chip ${s}">${x.mark && x.mark !== 'o' ? MARK[x.mark] : ''}<b>${esc(x.en)}</b>
+          <span class="cko ${hidden(i) ? 'hidden' : ''}" data-ko="${i}">${esc(x.ko)}</span></span>`)).join('')}</div>` : ''}
+      ${w.ex && ui.exOpen.has(i) ? `<div class="extra"><div class="ex">${esc(w.ex.en)}<small>${esc(w.ex.ko)}</small></div></div>` : ''}
+      </div>`).join('')}</div>` : (open ? '<p class="hint">이 Day는 새 단어 없이 복습만 있어요. 단어를 더 넣으면 여기에 채워져요.</p>' : '')}
     <div class="pager">
-      <button class="btn ghost" id="prev" ${idx ? '' : 'disabled'}>◀ 이전</button>
-      <button class="btn ghost" id="next" ${idx < list.length - 1 ? '' : 'disabled'}>다음 ▶</button>
+      <button class="btn ghost" id="prev" ${n > 1 ? '' : 'disabled'}>◀ Day ${n - 1 || ''}</button>
+      <button class="btn ghost" id="next" ${n < plan.length && isOpen(f, plan, n + 1) ? '' : 'disabled'}>Day ${n + 1} ▶</button>
     </div>`;
+  document.querySelectorAll('[data-task]').forEach(b => b.onclick = () => {
+    const t = tasks[+b.dataset.task], items = itemsFor(f, t.ids, t.onlyWrong);
+    if (!items.length) { if (!t.done) { markDone(f, n, t.kind, t.ids); save(); } return day(); }
+    startTest(items, { fid: f.id, n, kind: t.done ? 'practice' : t.kind, ids: t.ids }, `Day ${n} ${taskName(t)}${t.done ? ' 연습' : ''}`);
+  });
   document.querySelectorAll('[data-ko]').forEach(el => el.onclick = () => {
     const i = +el.dataset.ko; ui.shown.has(i) ? ui.shown.delete(i) : ui.shown.add(i);
     document.querySelectorAll(`[data-ko="${i}"]`).forEach(x => x.classList.toggle('hidden', hidden(i)));
   });
-  const keepScroll = async fn => { const y = scrollY; await fn(); page(); scrollTo(0, y); };
-  document.querySelectorAll('[data-rel]').forEach(b => b.onclick = () => keepScroll(() => makeRelated(p.words[+b.dataset.rel])));
+  const keepScroll = async fn => { const y = scrollY; await fn(); day(); scrollTo(0, y); };
+  document.querySelectorAll('[data-rel]').forEach(b => b.onclick = () => keepScroll(() => makeRelated(words[+b.dataset.rel])));
   document.querySelectorAll('[data-ex]').forEach(b => b.onclick = () => keepScroll(async () => {
-    const i = +b.dataset.ex, w = p.words[i];
-    ui.exOpen ||= new Set();
+    const i = +b.dataset.ex, w = words[i];
     if (ui.exOpen.has(i)) return ui.exOpen.delete(i);
     if (!w.ex) await makeExample(w);
     if (w.ex) ui.exOpen.add(i);
   }));
-  $('#start-test').onclick = () => startPageTest(p);
-  $('#toggle-all').onclick = () => { ui.hideAll = !ui.hideAll; ui.shown = new Set(); page(); };
-  $('#del-page').onclick = () => {
-    if (!confirm(`Day ${p.day} 페이지를 삭제할까요? 되돌릴 수 없어요.`)) return;
-    db.pages = db.pages.filter(x => x !== p); save(); ui.view = 'home'; render();
-  };
-  const go = d => { const t = list[idx + d]; if (t) { const keep = ui.hideAll; openPage(t.id); ui.hideAll = keep; page(); } };
-  $('#prev').onclick = () => go(-1);
-  $('#next').onclick = () => go(1);
+  $('#toggle-all')?.addEventListener('click', () => { ui.hideAll = !ui.hideAll; ui.shown = new Set(); day(); });
+  $('#prev').onclick = () => openDay(n - 1);
+  $('#next').onclick = () => openDay(n + 1);
   bindGo();
 }
 
-// Swipe left/right to flip notebook pages.
+// Swipe left/right to flip Days.
 let touchX = null;
 document.addEventListener('touchstart', e => { touchX = e.touches[0].clientX; }, { passive: true });
 document.addEventListener('touchend', e => {
-  if (ui.view !== 'page' || touchX === null) return;
+  if (ui.view !== 'day' || touchX === null) return;
   const dx = e.changedTouches[0].clientX - touchX; touchX = null;
-  if (Math.abs(dx) > 80) $(dx < 0 ? '#next' : '#prev')?.click();
+  if (Math.abs(dx) > 80) { const b = $(dx < 0 ? '#next' : '#prev'); if (b && !b.disabled) b.click(); }
 });
 
 function settings() {
@@ -597,7 +574,7 @@ function settings() {
     <input id="key" type="password" autocomplete="off" placeholder="sk-ant-..." value="${esc(s.apiKey)}">
     <label for="per">하루 단어 수</label>
     <input id="per" type="number" min="1" max="200" inputmode="numeric" value="${s.perDay}">
-    <p class="hint">새로 저장하는 단어부터 적용돼요.</p>
+    <p class="hint">아직 1차 시험을 안 본 Day부터 적용돼요.</p>
     <label>백업</label>
     <div class="toolbar">
       <button class="btn ghost" id="backup">백업 파일 저장</button>
@@ -618,8 +595,6 @@ function settings() {
   $('#load').onclick = () => $('#restore').click();
   bindGo();
 }
-
-function bindGo() { document.querySelectorAll('[data-go]').forEach(b => b.onclick = () => { ui.view = b.dataset.go; render(); }); }
 
 render();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
