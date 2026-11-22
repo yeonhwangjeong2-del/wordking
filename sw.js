@@ -1,5 +1,5 @@
 // Bump VERSION on every deploy so iPad picks up the new files.
-const VERSION = 'wk-6';
+const VERSION = 'wk-7';
 const FILES = ['./', 'index.html', 'app.js', 'manifest.json', 'icon.png'];
 
 self.addEventListener('install', e => {

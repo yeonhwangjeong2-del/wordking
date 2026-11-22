@@ -165,7 +165,7 @@ $('#photo').addEventListener('change', async e => {
       found.push(...out.words.filter(w => w.en.trim()));
     }
     if (!found.length) throw new Error('사진에서 영단어를 찾지 못했어요.');
-    ui.draft = found; ui.view = 'review';
+    ui.draft = found; ui.manual = false; ui.view = 'review';
   } catch (err) { alert(err.message); }
   busy(); render();
 });
@@ -215,6 +215,29 @@ function startPageTest(p) {
     return startTest(items, nr.kind, `Day ${p.day} ${ROUND[nr.kind]}`, back);
   }
   startTest(pageItems(p), 'practice', `Day ${p.day} 연습`, back);
+}
+
+// ---------- meanings for typed words ----------
+const FILL_SYSTEM = `For each English word or phrase, give its Korean meaning the way a Korean vocabulary book would:
+the 1-2 most common meanings, short, separated by a comma.`;
+const FILL_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['items'],
+  properties: { items: { type: 'array', items: {
+    type: 'object', additionalProperties: false, required: ['i', 'ko'],
+    properties: { i: { type: 'integer' }, ko: { type: 'string' } }
+  } } }
+};
+// Fills empty ko in place. Returns false if the AI call failed (the error is already shown).
+async function fillMeanings(words) {
+  const ask = words.map((w, i) => ({ i, en: w.en.trim() })).filter(x => x.en && !words[x.i].ko.trim());
+  if (!ask.length) return true;
+  busy(`뜻 ${ask.length}개 채우는 중…`);
+  try {
+    const out = await ai(FILL_SYSTEM, JSON.stringify(ask), FILL_SCHEMA);
+    for (const { i, ko } of out.items) if (words[i] && !words[i].ko.trim()) words[i].ko = ko.trim();
+    return true;
+  } catch (err) { alert(err.message); return false; }
+  finally { busy(); }
 }
 
 // ---------- synonyms / antonyms / example ----------
@@ -418,7 +441,8 @@ function home() {
     ${bd && big.length ? `<button class="row bigrev ${bd <= today() ? 'now' : ''}" id="big">
       <b>🔥 오답 총복습</b><span>틀린 적 있는 단어 ${big.length}개</span>
       <small>${bd <= today() ? '오늘 할 차례!' : `${md(bd)} 예정 · 미리 연습`}</small></button>` : ''}
-    <button class="btn big" id="snap">📷 사진으로 단어 추가</button>
+    <div class="add-row"><button class="btn big" id="snap">📷 사진으로 단어 추가</button>
+      <button class="btn big ghost" id="type">✍️ 직접 입력</button></div>
     <div class="list">
       ${pages.length ? pages.map(p => `
         <button class="row" data-page="${p.id}"><b>Day ${p.day}</b><span>${p.words.length}단어</span>${dayStatus(p)}</button>`).join('')
@@ -429,6 +453,7 @@ function home() {
     startTest(big, bd <= today() ? 'big' : 'practice', `${f.name} 오답 총복습`, { view: 'home' });
   });
   $('#snap').onclick = () => $('#photo').click();
+  $('#type').onclick = () => { ui.draft = [{ en: '', ko: '' }]; ui.manual = true; ui.view = 'review'; render(); $('[data-k="en"]').focus(); };
   // Inline input instead of prompt(): prompt() is blocked in some browsers.
   $('#add-folder').onclick = () => {
     $('.tabs').outerHTML = `<form class="tabs" id="folder-form">
@@ -452,25 +477,37 @@ function review() {
   const folder = db.folders.find(f => f.id === ui.folderId);
   const per = db.settings.perDay;
   $('#app').innerHTML = `
-    <header><button class="icon-btn" id="cancel" aria-label="취소">✕</button><h1>단어 확인</h1></header>
-    <p class="hint">${ui.draft.length}개를 찾았어요. 틀린 건 고치고 저장하세요.
-      <b>${esc(folder.name)}</b>에 하루 ${per}개씩 Day ${Math.ceil(ui.draft.length / per)}개로 나눠 저장돼요.</p>
+    <header><button class="icon-btn" id="cancel" aria-label="취소">✕</button><h1>${ui.manual ? '단어 입력' : '단어 확인'}</h1></header>
+    <p class="hint">${ui.manual ? '영어 철자만 쓰면 뜻은 AI가 채워요. 뜻을 직접 써도 돼요.' : `${ui.draft.length}개를 찾았어요. 틀린 건 고치고 저장하세요.`}
+      <b>${esc(folder.name)}</b>에 하루 ${per}개씩 Day ${Math.max(1, Math.ceil(ui.draft.length / per))}개로 나눠 저장돼요.</p>
     <div id="edits">${ui.draft.map((w, i) => `
       <div class="edit"><input data-i="${i}" data-k="en" value="${esc(w.en)}" aria-label="영단어">
-      <input data-i="${i}" data-k="ko" value="${esc(w.ko)}" aria-label="뜻">
+      <input data-i="${i}" data-k="ko" value="${esc(w.ko)}" placeholder="뜻 (비우면 AI)" aria-label="뜻">
       <button class="icon-btn" data-del="${i}" aria-label="삭제">✕</button></div>`).join('')}</div>
-    <div class="toolbar"><button class="btn ghost" id="add-row">＋ 단어 추가</button></div>
+    <div class="toolbar"><button class="btn ghost" id="add-row">＋ 단어 추가</button>
+      <button class="btn ghost" id="fill">✨ 빈 뜻 AI로 채우기</button></div>
     <button class="btn big" id="save">저장</button>`;
-  document.querySelectorAll('[data-k]').forEach(inp => inp.oninput = () => { ui.draft[inp.dataset.i][inp.dataset.k] = inp.value; });
+  const addRow = () => { ui.draft.push({ en: '', ko: '' }); review(); document.querySelector(`[data-i="${ui.draft.length - 1}"][data-k="en"]`).focus(); };
+  document.querySelectorAll('[data-k]').forEach(inp => {
+    inp.oninput = () => { ui.draft[inp.dataset.i][inp.dataset.k] = inp.value; };
+    // Enter: English → its meaning box, meaning → a new row (fast typing on the iPad keyboard)
+    inp.onkeydown = e => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      if (inp.dataset.k === 'en') inp.nextElementSibling.focus(); else addRow();
+    };
+  });
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { ui.draft.splice(+b.dataset.del, 1); review(); });
-  $('#add-row').onclick = () => { ui.draft.push({ en: '', ko: '' }); review(); };
-  $('#cancel').onclick = () => { if (confirm('찾은 단어를 버릴까요?')) { ui.draft = []; ui.view = 'home'; render(); } };
-  $('#save').onclick = () => {
+  $('#add-row').onclick = addRow;
+  $('#fill').onclick = async () => { await fillMeanings(ui.draft); review(); };
+  $('#cancel').onclick = () => { if (confirm(ui.manual ? '입력한 단어를 버릴까요?' : '찾은 단어를 버릴까요?')) { ui.draft = []; ui.view = 'home'; render(); } };
+  $('#save').onclick = async () => {
+    if (ui.draft.some(w => w.en.trim() && !w.ko.trim()) && !(await fillMeanings(ui.draft))) return review();
     const words = ui.draft.map(w => ({ en: w.en.trim(), ko: w.ko.trim() })).filter(w => w.en);
     if (!words.length) return alert('저장할 단어가 없어요.');
     let day = Math.max(0, ...folderPages(ui.folderId).map(p => p.day));
     for (const part of chunk(words, per)) db.pages.push({ id: uid(), folderId: ui.folderId, day: ++day, createdAt: Date.now(), words: part });
-    save(); ui.draft = []; ui.view = 'home'; render();
+    save(); ui.draft = []; ui.manual = false; ui.view = 'home'; render();
   };
 }
 
